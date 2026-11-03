@@ -10,7 +10,7 @@ use crate::asc_core::findrefs::findrefs_manager::{
     FindRefInput, FindRefManager, FindRefResult,
 };
 use crate::asc_core::utils::decompiler::{
-    decompile_dex_bytes, decompile_dex_bytes_with_metadata, MemberReference,
+    MemberReference, decompile_dex_bytes, decompile_dex_output_with_options,
 };
 use crate::asc_core::utils::tinydex::DEX;
 
@@ -88,27 +88,66 @@ impl AscHandler {
         dex_buf: &[u8],
         dalvik_class: &str,
     ) -> (String, Vec<MemberReference>) {
-        let (direct_source, direct_refs) = decompile_dex_bytes_with_metadata(dex_buf, dalvik_class);
-        if !direct_source.starts_with("/* RadGuard decompiler error:")
-            && !direct_source.starts_with("Error: Class ")
-        {
-            if self.debug {
-                eprintln!("[Decompiler] path=direct class={dalvik_class}");
+        self.getclass_with_metadata_mode(dex_buf, dalvik_class, false)
+    }
+
+    pub fn getclass_with_metadata_mode(
+        &self,
+        dex_buf: &[u8],
+        dalvik_class: &str,
+        semantic_metadata: bool,
+    ) -> (String, Vec<MemberReference>) {
+        let output = self.getclass_output(dex_buf, dalvik_class, semantic_metadata, None);
+        (output.source, output.member_references)
+    }
+
+    pub fn getclass_output(
+        &self,
+        dex_buf: &[u8],
+        dalvik_class: &str,
+        semantic_metadata: bool,
+        names: Option<std::sync::Arc<Vec<radguard::writer::VariableNames>>>,
+    ) -> radguard::writer::SourceOutput {
+        self.getclass_output_with_symbols(dex_buf, dalvik_class, semantic_metadata, names, None)
+    }
+
+    pub fn getclass_output_with_symbols(
+        &self,
+        dex_buf: &[u8],
+        dalvik_class: &str,
+        semantic_metadata: bool,
+        names: Option<std::sync::Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<std::sync::Arc<radguard::writer::SymbolNames>>,
+    ) -> radguard::writer::SourceOutput {
+        self.getclass_output_with_options(dex_buf, dalvik_class, semantic_metadata, names, symbols, None)
+    }
+
+    pub fn getclass_output_with_options(
+        &self,
+        dex_buf: &[u8],
+        dalvik_class: &str,
+        semantic_metadata: bool,
+        names: Option<std::sync::Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<std::sync::Arc<radguard::writer::SymbolNames>>,
+        options: Option<radguard::writer::RenderOptions>,
+    ) -> radguard::writer::SourceOutput {
+        let parsed = radguard::Decompiler::parse(dex_buf).map(|decompiler| {
+            decompiler.with_semantic_metadata(semantic_metadata)
+                .with_variable_names(names.clone())
+                .with_symbol_names(symbols.clone())
+                .with_render_options(options)
+        });
+        match parsed {
+            Ok(decompiler) => self.getclass_output_from_decompiler(&decompiler, dex_buf, dalvik_class),
+            Err(error) => {
+                if self.debug {
+                    eprintln!("[Decompiler] path=fallback reason={error} class={dalvik_class}");
+                }
+                let mut manager = DexManager::from_bytes(dex_buf.to_vec(), self.debug);
+                let new_dex_bytes = manager.extract_and_rebuild(dalvik_class);
+                decompile_dex_output_with_options(&new_dex_bytes, dalvik_class, semantic_metadata, names, symbols, options)
             }
-            return (direct_source, direct_refs);
         }
-        if self.debug {
-            eprintln!(
-                "[Decompiler] path=fallback reason={} class={dalvik_class}",
-                direct_source
-                    .lines()
-                    .next()
-                    .unwrap_or("direct decompile failed")
-            );
-        }
-        let mut manager = DexManager::from_bytes(dex_buf.to_vec(), self.debug);
-        let new_dex_bytes = manager.extract_and_rebuild(dalvik_class);
-        decompile_dex_bytes_with_metadata(&new_dex_bytes, dalvik_class)
     }
 
     pub fn getclass_from_decompiler(
@@ -117,12 +156,31 @@ impl AscHandler {
         dex_buf: &[u8],
         dalvik_class: &str,
     ) -> (String, Vec<MemberReference>) {
+        let output = self.getclass_output_from_decompiler(decompiler, dex_buf, dalvik_class);
+        (output.source, output.member_references)
+    }
+
+    pub fn getclass_output_from_decompiler(
+        &self,
+        decompiler: &radguard::Decompiler<'_>,
+        dex_buf: &[u8],
+        dalvik_class: &str,
+    ) -> radguard::writer::SourceOutput {
         match decompiler.decompile_class(dalvik_class) {
+            Err(error @ radguard::Error::UnpairedSurrogate { .. }) => {
+                // Rebuilding could replace the very UTF-16 units that caused this
+                // rejection. Only the affected class needs another renderer.
+                radguard::writer::SourceOutput {
+                    source: format!("/* RadGuard decompiler error: {error} */\n"),
+                    render_options: decompiler.render_options(),
+                    ..Default::default()
+                }
+            }
             Ok(Some(output)) => {
                 if self.debug {
                     eprintln!("[Decompiler] path=direct class={dalvik_class}");
                 }
-                (output.source, output.member_references)
+                output
             }
             Ok(None) => {
                 if self.debug {
@@ -132,7 +190,14 @@ impl AscHandler {
                 }
                 let mut manager = DexManager::from_bytes(dex_buf.to_vec(), self.debug);
                 let new_dex_bytes = manager.extract_and_rebuild(dalvik_class);
-                decompile_dex_bytes_with_metadata(&new_dex_bytes, dalvik_class)
+                decompile_dex_output_with_options(
+                    &new_dex_bytes,
+                    dalvik_class,
+                    decompiler.semantic_metadata_enabled(),
+                    decompiler.variable_names(),
+                    decompiler.symbol_names(),
+                    decompiler.render_options(),
+                )
             }
             Err(error) => {
                 if self.debug {
@@ -140,7 +205,14 @@ impl AscHandler {
                 }
                 let mut manager = DexManager::from_bytes(dex_buf.to_vec(), self.debug);
                 let new_dex_bytes = manager.extract_and_rebuild(dalvik_class);
-                decompile_dex_bytes_with_metadata(&new_dex_bytes, dalvik_class)
+                decompile_dex_output_with_options(
+                    &new_dex_bytes,
+                    dalvik_class,
+                    decompiler.semantic_metadata_enabled(),
+                    decompiler.variable_names(),
+                    decompiler.symbol_names(),
+                    decompiler.render_options(),
+                )
             }
         }
     }

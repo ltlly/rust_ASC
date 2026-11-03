@@ -24,6 +24,48 @@ pub(crate) struct DexEntry {
     pub comp_method: u16,
 }
 
+/// Resolve an explicitly selected central-directory name, including directories or
+/// nested archive entries. Do not apply the APK classes*.dex discovery shortcut.
+pub(crate) fn exact_entry(buf: &[u8], name: &str) -> Result<DexEntry, String> {
+    let end = _find_eocd(buf).ok_or("invalid ZIP archive")?;
+    let size = _STRUCT_I::unpack_from(buf, end + 12) as usize;
+    let start = _STRUCT_I::unpack_from(buf, end + 16) as usize;
+    let limit = start
+        .checked_add(size)
+        .filter(|&n| n <= end)
+        .ok_or("truncated ZIP central directory")?;
+    let mut pos = start;
+    let mut selected = None;
+    while pos < limit {
+        if pos + 46 > limit || buf[pos..pos + 4] != *_CD_SIG {
+            return Err("invalid ZIP central-directory record".to_owned());
+        }
+        let name_end = pos + 46 + _STRUCT_H::unpack_from(buf, pos + 28) as usize;
+        let next = name_end
+            .checked_add(_STRUCT_H::unpack_from(buf, pos + 30) as usize)
+            .and_then(|n| n.checked_add(_STRUCT_H::unpack_from(buf, pos + 32) as usize))
+            .filter(|&n| n <= limit)
+            .ok_or("truncated ZIP entry")?;
+        if &buf[pos + 46..name_end] == name.as_bytes() {
+            if selected.is_some() {
+                return Err(format!("ambiguous ZIP entry: {name}"));
+            }
+            if _STRUCT_H::unpack_from(buf, pos + 8) & 1 != 0 {
+                return Err(format!("encrypted ZIP entry: {name}"));
+            }
+            selected = Some(DexEntry {
+                name: name.to_owned(),
+                uncomp_size: _STRUCT_I::unpack_from(buf, pos + 24),
+                comp_size: _STRUCT_I::unpack_from(buf, pos + 20),
+                local_header_off: _STRUCT_I::unpack_from(buf, pos + 42),
+                comp_method: _STRUCT_H::unpack_from(buf, pos + 10),
+            });
+        }
+        pos = next;
+    }
+    selected.ok_or_else(|| format!("ZIP entry not found: {name}"))
+}
+
 pub(crate) fn _find_eocd(buf: &[u8]) -> Option<usize> {
     if buf.len() < 22 {
         return None;
@@ -315,9 +357,7 @@ pub(crate) fn _inflate_dex_into_with(
             unsafe { out.set_len(size) };
             let actual_size = decompressor
                 .deflate_decompress(comp_view, out)
-                .map_err(|error| {
-                    format!("libdeflate cannot decompress {}: {error}", entry.name)
-                })?;
+                .map_err(|error| format!("libdeflate cannot decompress {}: {error}", entry.name))?;
             out.truncate(actual_size);
         }
         method => return Err(format!("unsupported compression method: {method}")),

@@ -29,10 +29,11 @@ use crate::asc_client::apk::dex_reader::{
 };
 use crate::asc_client::apk::loader::{
     _inflate_dex_into_with, _inflate_dex_prefix_into,
-    _parse_cd_dex_entries_checked as _parse_entries_checked, DexEntry,
+    _parse_cd_dex_entries_checked as _parse_entries_checked, DexEntry, exact_entry,
 };
 use crate::asc_client::dex_container::{
-    dex041_logical_offsets, into_logical_dex_buffers, iter_logical_dex_buffers,
+    dex041_logical_offsets, into_logical_dex_buffers, is_dex041_container,
+    iter_logical_dex_buffers, normalize_dex041_logical,
 };
 use crate::asc_core::findrefs::findrefs_manager::FindRefInput;
 use crate::asc_core::findrefs::scan::method_id_scan::render_dex_methods;
@@ -145,6 +146,15 @@ fn _inflate_and_hit(
         (t2 - t1).as_secs_f64() * 1_000_000.0,
     ));
     (hit, hit_name, hit_data)
+}
+
+/// An exact physical DEX selection supplied by an input plugin. Entries are
+/// ordered outermost first; offsets identify headers, not class definitions.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DexSourceUnit {
+    pub entries: Vec<String>,
+    pub offset: usize,
 }
 
 pub struct ApkHandler {
@@ -925,6 +935,55 @@ impl ApkHandler {
         dalvik_classes: &[String],
         include_metadata: bool,
     ) -> Result<BatchClassResult, String> {
+        self.try_get_classes_batch_mode(dalvik_classes, include_metadata, false)
+    }
+
+    pub fn try_get_classes_batch_mode(
+        &self,
+        dalvik_classes: &[String],
+        include_metadata: bool,
+        semantic_metadata: bool,
+    ) -> Result<BatchClassResult, String> {
+        self.try_get_class_outputs(dalvik_classes, include_metadata, semantic_metadata, None)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|(cls, entry)| {
+                        (
+                            cls,
+                            entry.map(|(dex, output)| {
+                                (dex, output.source, output.member_references)
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+    }
+
+    pub fn try_get_class_outputs(
+        &self,
+        dalvik_classes: &[String],
+        include_metadata: bool,
+        semantic_metadata: bool,
+        variable_names: Option<Arc<Vec<radguard::writer::VariableNames>>>,
+    ) -> Result<Vec<(String, Option<(String, radguard::writer::SourceOutput)>)>, String> {
+        self.try_get_class_outputs_with_symbols(
+            dalvik_classes,
+            include_metadata,
+            semantic_metadata,
+            variable_names,
+            None,
+        )
+    }
+
+    pub fn try_get_class_outputs_with_symbols(
+        &self,
+        dalvik_classes: &[String],
+        include_metadata: bool,
+        semantic_metadata: bool,
+        variable_names: Option<Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<Arc<radguard::writer::SymbolNames>>,
+    ) -> Result<Vec<(String, Option<(String, radguard::writer::SourceOutput)>)>, String> {
         use std::collections::{HashMap, HashSet};
         if dalvik_classes.is_empty() {
             return Ok(Vec::new());
@@ -935,12 +994,18 @@ impl ApkHandler {
                 return Ok(vec![(cls.clone(), None)]);
             };
             let asc = crate::asc_client::asc_handler::AscHandler::new(self.debug);
-            let (source, refs) = if include_metadata {
-                asc.getclass_with_metadata(&dex_buf, cls)
-            } else {
-                (asc.getclass(&dex_buf, cls), Vec::new())
-            };
-            return Ok(vec![(cls.clone(), Some((dex_name, source, refs)))]);
+            let mut output = asc.getclass_output_with_symbols(
+                &dex_buf,
+                cls,
+                semantic_metadata,
+                variable_names,
+                symbols.clone(),
+            );
+            if !include_metadata {
+                output.member_references.clear();
+                output.method_variables.clear();
+            }
+            return Ok(vec![(cls.clone(), Some((dex_name, output)))]);
         }
 
         let (mm, cached_entries) = self._open_apk_cached()?;
@@ -955,13 +1020,11 @@ impl ApkHandler {
 
         let target_set: HashSet<&str> = dalvik_classes.iter().map(String::as_str).collect();
         let mut remaining: HashSet<String> = dalvik_classes.iter().cloned().collect();
-        let mut decompiled_map: HashMap<String, BatchClassEntry> =
+        let mut decompiled_map: HashMap<String, (String, radguard::writer::SourceOutput)> =
             HashMap::with_capacity(target_set.len());
 
         let mut scratch = Vec::new();
         let mut decompressor = libdeflater::Decompressor::new();
-        let worker_count = self.max_workers.max(1);
-
         for entry in &entries {
             if remaining.is_empty() {
                 break;
@@ -1009,76 +1072,187 @@ impl ApkHandler {
                 if matched_in_dex.is_empty() {
                     continue;
                 }
-                let arc_bytes: Arc<[u8]> = Arc::from(dex_buf);
-                let Ok(decompiler) =
-                    radguard::Decompiler::parse_owned(Arc::clone(&arc_bytes))
-                        .map(|d| d.with_debug(self.debug))
-                else {
-                    let asc = crate::asc_client::asc_handler::AscHandler::new(self.debug);
-                    for cls in matched_in_dex {
-                        let (src, refs) = if include_metadata {
-                            asc.getclass_with_metadata(&arc_bytes, &cls)
-                        } else {
-                            (asc.getclass(&arc_bytes, &cls), Vec::new())
-                        };
-                        decompiled_map.insert(cls, (dex_name.clone(), src, refs));
-                    }
-                    continue;
-                };
-                let pool_size = worker_count.min(matched_in_dex.len());
-                if pool_size <= 1 {
-                    let asc = crate::asc_client::asc_handler::AscHandler::new(self.debug);
-                    for cls in matched_in_dex {
-                        let (src, mut refs) =
-                            asc.getclass_from_decompiler(&decompiler, &arc_bytes, &cls);
-                        if !include_metadata {
-                            refs.clear();
-                        }
-                        decompiled_map.insert(cls, (dex_name.clone(), src, refs));
-                    }
-                } else {
-                    let chunk_size = matched_in_dex.len().div_ceil(pool_size);
-                    let debug = self.debug;
-                    let chunk_results: Vec<Vec<BatchClassEntry>> = thread::scope(|scope| {
-                        let mut handles = Vec::with_capacity(pool_size);
-                        for chunk in matched_in_dex.chunks(chunk_size) {
-                            let decompiler = &decompiler;
-                            let arc_bytes = &arc_bytes;
-                            handles.push(scope.spawn(move || {
-                                let asc = crate::asc_client::asc_handler::AscHandler::new(debug);
-                                chunk
-                                    .iter()
-                                    .map(|cls| {
-                                        let (src, mut refs) = asc.getclass_from_decompiler(
-                                            decompiler,
-                                            arc_bytes,
-                                            cls,
-                                        );
-                                        if !include_metadata {
-                                            refs.clear();
-                                        }
-                                        (cls.clone(), src, refs)
-                                    })
-                                    .collect()
-                            }));
-                        }
-                        handles
-                            .into_iter()
-                            .filter_map(|h| h.join().ok())
-                            .collect()
-                    });
-                    for group in chunk_results {
-                        for (cls, src, refs) in group {
-                            decompiled_map.insert(cls, (dex_name.clone(), src, refs));
-                        }
-                    }
+                for (cls, output) in self.render_unit(
+                    dex_buf,
+                    &matched_in_dex,
+                    include_metadata,
+                    semantic_metadata,
+                    variable_names.clone(),
+                    symbols.clone(),
+                    None,
+                ) {
+                    decompiled_map.insert(cls, (dex_name.clone(), output));
                 }
             }
         }
 
         Ok(dalvik_classes
             .iter()
-            .map(|cls| (cls.clone(), decompiled_map.get(cls).cloned()))
+            .map(|cls| (cls.clone(), decompiled_map.remove(cls)))
             .collect())
+    }
+
+    /// Select bytes before resolving class descriptors, preserving the host's
+    /// choice among duplicates. This shares the existing inflate and render paths.
+    pub fn try_get_class_outputs_in_unit(
+        &self,
+        unit: &DexSourceUnit,
+        targets: &[String],
+        semantic_metadata: bool,
+        variable_names: Option<Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<Arc<radguard::writer::SymbolNames>>,
+    ) -> Result<Vec<(String, Option<(String, radguard::writer::SourceOutput)>)>, String> {
+        self.try_get_class_outputs_in_unit_with_options(unit, targets, semantic_metadata, variable_names, symbols, None)
+    }
+
+    pub fn try_get_class_outputs_in_unit_with_options(
+        &self,
+        unit: &DexSourceUnit,
+        targets: &[String],
+        semantic_metadata: bool,
+        variable_names: Option<Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<Arc<radguard::writer::SymbolNames>>,
+        render_options: Option<radguard::writer::RenderOptions>,
+    ) -> Result<Vec<(String, Option<(String, radguard::writer::SourceOutput)>)>, String> {
+        let file = File::open(&self.apk_path).map_err(|e| format!("cannot open input: {e}"))?;
+        let mm = unsafe { MmapOptions::new().map(&file) }
+            .map_err(|e| format!("cannot map input: {e}"))?;
+        let mut bytes = None;
+        let mut decompressor = libdeflater::Decompressor::new();
+        for name in &unit.entries {
+            let data = bytes.as_deref().unwrap_or(&mm[..]);
+            let entry = exact_entry(data, name)?;
+            let mut next = Vec::new();
+            _inflate_dex_into_with(data, &entry, &mut next, &mut decompressor)?;
+            bytes = Some(next);
+        }
+        let data = bytes.as_deref().unwrap_or(&mm[..]);
+        if data.len() < 0x70 || !data.starts_with(b"dex\n") || data[7] != 0 {
+            return Err("selected input is not a DEX unit".to_owned());
+        }
+        let offset = unit.offset;
+        if !dex041_logical_offsets(data).contains(&offset) {
+            return Err("selected DEX header offset is not present".to_owned());
+        }
+        if is_dex041_container(data) {
+            if offset + 0x78 > data.len()
+                || u32::from_le_bytes(data[offset + 0x24..offset + 0x28].try_into().unwrap())
+                    != 0x78
+                || u32::from_le_bytes(data[offset + 0x74..offset + 0x78].try_into().unwrap())
+                    as usize
+                    != offset
+                || u32::from_le_bytes(data[offset + 0x70..offset + 0x74].try_into().unwrap())
+                    as usize
+                    != data.len()
+            {
+                return Err("invalid selected DEX 041 header/container".to_owned());
+            }
+        }
+        let dex = if offset == 0 {
+            bytes.unwrap_or_else(|| mm.to_vec())
+        } else {
+            normalize_dex041_logical(data, offset)
+        };
+        let mut outputs: std::collections::HashMap<_, _> = self
+            .render_unit(
+                dex,
+                targets,
+                true,
+                semantic_metadata,
+                variable_names,
+                symbols,
+                render_options,
+            )
+            .into_iter()
+            .collect();
+        let label = unit
+            .entries
+            .last()
+            .map(String::as_str)
+            .unwrap_or(&self.apk_path);
+        Ok(targets
+            .iter()
+            .map(|cls| {
+                (
+                    cls.clone(),
+                    outputs.remove(cls).map(|out| (label.to_owned(), out)),
+                )
+            })
+            .collect())
+    }
+
+    fn render_unit(
+        &self,
+        dex: Vec<u8>,
+        classes: &[String],
+        include_metadata: bool,
+        semantic_metadata: bool,
+        variable_names: Option<Arc<Vec<radguard::writer::VariableNames>>>,
+        symbols: Option<Arc<radguard::writer::SymbolNames>>,
+        render_options: Option<radguard::writer::RenderOptions>,
+    ) -> Vec<(String, radguard::writer::SourceOutput)> {
+        if classes.is_empty() {
+            return Vec::new();
+        }
+        let bytes: Arc<[u8]> = Arc::from(dex);
+        let parsed = radguard::Decompiler::parse_owned(Arc::clone(&bytes)).map(|d| {
+            d.with_debug(self.debug)
+                .with_semantic_metadata(semantic_metadata)
+                .with_variable_names(variable_names.clone())
+                .with_symbol_names(symbols.clone())
+                .with_render_options(render_options)
+        });
+        // Membership comes from the already parsed DEX rather than a second name scan.
+        let present;
+        let classes = if let Ok(decompiler) = &parsed {
+            present = classes
+                .iter()
+                .filter(|cls| decompiler.dex().class(cls).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            present.as_slice()
+        } else {
+            classes
+        };
+        if classes.is_empty() {
+            return Vec::new();
+        }
+        let render = |cls: &String| {
+            let asc = crate::asc_client::asc_handler::AscHandler::new(self.debug);
+            let mut output = match &parsed {
+                Ok(decompiler) => asc.getclass_output_from_decompiler(decompiler, &bytes, cls),
+                Err(_) => asc.getclass_output_with_options(
+                    &bytes,
+                    cls,
+                    semantic_metadata,
+                    variable_names.clone(),
+                    symbols.clone(),
+                    render_options,
+                ),
+            };
+            if !include_metadata {
+                output.member_references.clear();
+                output.method_variables.clear();
+            }
+            (cls.clone(), output)
+        };
+        let workers = self.max_workers.max(1).min(classes.len());
+        if workers <= 1 {
+            return classes.iter().map(render).collect();
+        }
+        thread::scope(|scope| {
+            let handles: Vec<_> = classes
+                .chunks(classes.len().div_ceil(workers))
+                .map(|chunk| {
+                    let render = &render;
+                    scope.spawn(move || chunk.iter().map(render).collect::<Vec<_>>())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .flatten()
+                .collect()
+        })
     }
 }

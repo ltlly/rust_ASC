@@ -20,6 +20,7 @@ debug = true
 opt-level = 0
 
 [dependencies]
+sha2 = "0.10.9"
 rmcp = { version = "3.5.1", optional = true, default-features = false, features = ["server", "transport-io"] }
 tokio = { version = "1", optional = true, features = ["rt", "io-std", "time"] }
 serde = { version = "1", features = ["derive"] }

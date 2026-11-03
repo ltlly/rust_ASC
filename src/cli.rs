@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::time::Instant;
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use radguard::cli::{ExportOptions, ExportProgress, export_to_directory};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::asc_client::apk_handler::ApkHandler;
 use crate::asc_client::asc_handler::{AscHandler, FindRefsDisplayOptions};
@@ -15,6 +16,34 @@ use crate::asc_core::findrefs::findrefs_manager::FindRefInput;
 use crate::asc_core::findrefs::locator::field_locator::FieldFind;
 use crate::asc_core::findrefs::locator::method_locator::MethodFind;
 use crate::asc_core::utils::decompiler::{MemberKind, MemberReference};
+
+/// Identity of the actual running binary, including launchers and replacement races.
+/// This is collected only for semantic output and cached once per process.
+fn native_binary_revision() -> std::result::Result<&'static str, String> {
+    static REVISION: std::sync::OnceLock<std::result::Result<String, String>> =
+        std::sync::OnceLock::new();
+    REVISION
+        .get_or_init(|| {
+            let path = if cfg!(target_os = "linux") {
+                std::path::PathBuf::from("/proc/self/exe")
+            } else {
+                std::env::current_exe().map_err(|e| e.to_string())?
+            };
+            let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 65536];
+            loop {
+                let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        })
+        .as_deref()
+        .map_err(Clone::clone)
+}
 
 #[derive(Serialize)]
 struct MemberRefDto<'a> {
@@ -26,6 +55,10 @@ struct MemberRefDto<'a> {
     descriptor: &'a str,
     declaration: bool,
     synthetic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_end: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendered_name: Option<&'a str>,
 }
 
 impl<'a> From<&'a MemberReference> for MemberRefDto<'a> {
@@ -36,14 +69,27 @@ impl<'a> From<&'a MemberReference> for MemberRefDto<'a> {
             kind: match r.kind {
                 MemberKind::Field => "field",
                 MemberKind::Method => "method",
+                MemberKind::Type => "type",
+                MemberKind::Package => "package",
             },
             class: &r.class,
             name: &r.name,
             descriptor: &r.descriptor,
             declaration: r.declaration,
             synthetic: r.synthetic,
+            scope_end: r.scope_end,
+            rendered_name: r.rendered_name.as_deref(),
         }
     }
+}
+
+#[derive(Clone, Copy, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderOptionsDto {
+    version: u32,
+    escape_unicode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    use_imports: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -57,7 +103,110 @@ struct GetClassJsonItem<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     member_references: Vec<MemberRefDto<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variable_metadata_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_metadata_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    render_options: Option<RenderOptionsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_revision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_unit: Option<&'a crate::asc_client::apk_handler::DexSourceUnit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_revision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    method_variables: Vec<MethodVariablesDto<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VariableSpanDto {
+    start: usize,
+    end: usize,
+    declaration: bool,
+}
+
+struct VariableSpans<'a>(&'a [radguard::writer::VariableSpan]);
+
+impl Serialize for VariableSpans<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|span| VariableSpanDto {
+            start: span.start,
+            end: span.end,
+            declaration: span.declaration,
+        }))
+    }
+}
+
+#[derive(Serialize)]
+struct VariableDto<'a> {
+    id: &'a str,
+    name: &'a str,
+    descriptor: Option<&'a str>,
+    role: &'static str,
+    parameter: Option<usize>,
+    spans: VariableSpans<'a>,
+}
+
+#[derive(Serialize)]
+struct MethodVariablesDto<'a> {
+    class: &'a str,
+    name: &'a str,
+    descriptor: &'a str,
+    start: usize,
+    end: usize,
+    revision: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendered_revision: Option<&'a str>,
+    variables: Vec<VariableDto<'a>>,
+}
+
+impl<'a> From<&'a radguard::writer::MethodVariables> for MethodVariablesDto<'a> {
+    fn from(method: &'a radguard::writer::MethodVariables) -> Self {
+        Self {
+            class: &method.class,
+            name: &method.name,
+            descriptor: &method.descriptor,
+            start: method.start,
+            end: method.end,
+            revision: &method.revision,
+            rendered_revision: method.rendered_revision.as_deref(),
+            variables: method
+                .variables
+                .iter()
+                .map(|v| VariableDto {
+                    id: &v.id,
+                    name: &v.name,
+                    descriptor: v.descriptor.as_deref(),
+                    role: v.role,
+                    parameter: v.parameter,
+                    spans: VariableSpans(&v.spans),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct VariableNamesDto {
+    build: String,
+    origin: String,
+    class: String,
+    method: String,
+    revision: String,
+    names: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct SymbolNameDto {
+    kind: String,
+    class: String,
+    name: String,
+    descriptor: String,
+    alias: String,
 }
 
 fn _load_classes_from_file(path: &str) -> Result<Vec<String>, String> {
@@ -141,7 +290,9 @@ fn _build_member_find(
     }
 }
 
-fn _get_find_query(args: &ArgMatches) -> Result<(String, FindRefInput, FindRefsDisplayOptions), String> {
+fn _get_find_query(
+    args: &ArgMatches,
+) -> Result<(String, FindRefInput, FindRefsDisplayOptions), String> {
     let (find_type, find_args) = args
         .subcommand()
         .ok_or_else(|| "Unknown find type".to_owned())?;
@@ -213,6 +364,12 @@ fn _handle_getclass(args: &ArgMatches, mut out: impl Write) -> Result<(), String
     let apk_path = args.get_one::<String>("apk_path").unwrap();
     let debug = args.get_flag("debug");
     let json_output = args.get_flag("json");
+    let semantic_metadata = args.get_flag("semantic_metadata");
+    let native_build = if semantic_metadata {
+        Some(native_binary_revision()?)
+    } else {
+        None
+    };
     let thread = _get_worker_count(args)?;
 
     let mut targets = Vec::new();
@@ -266,7 +423,94 @@ fn _handle_getclass(args: &ArgMatches, mut out: impl Write) -> Result<(), String
         return Ok(());
     }
 
-    let results = apk_handler.try_get_classes_batch(&targets, json_output)?;
+    let names = if let Some(path) = args.get_one::<String>("variable_names") {
+        let data = fs::read(path).map_err(|e| format!("cannot read variable names {path}: {e}"))?;
+        let plans: Vec<VariableNamesDto> = serde_json::from_slice(&data)
+            .map_err(|e| format!("invalid variable name plan: {e}"))?;
+        let mut methods = HashSet::new();
+        for plan in &plans {
+            if Some(plan.build.as_str()) != native_build {
+                return Err("native variable build changed".to_owned());
+            }
+            if !targets.contains(&plan.class)
+                || !methods.insert((plan.class.clone(), plan.method.clone()))
+            {
+                return Err(
+                    "variable name plan has an unrequested class or duplicate method".to_owned(),
+                );
+            }
+        }
+        Some(std::sync::Arc::new(
+            plans
+                .into_iter()
+                .map(|p| radguard::writer::VariableNames {
+                    origin: p.origin,
+                    class: p.class,
+                    method: p.method,
+                    revision: p.revision,
+                    names: p.names,
+                })
+                .collect(),
+        ))
+    } else {
+        None
+    };
+    let symbols = if let Some(path) = args.get_one::<String>("symbol_names") {
+        let data = fs::read(path).map_err(|e| format!("cannot read symbol names {path}: {e}"))?;
+        let plans: Vec<SymbolNameDto> =
+            serde_json::from_slice(&data).map_err(|e| format!("invalid symbol names: {e}"))?;
+        let mut symbols = radguard::writer::SymbolNames::default();
+        for plan in plans {
+            let kind = match plan.kind.as_str() {
+                "type" => MemberKind::Type,
+                "method" => MemberKind::Method,
+                "field" => MemberKind::Field,
+                _ => return Err("invalid symbol name kind".to_owned()),
+            };
+            symbols
+                .add(kind, plan.class, &plan.name, &plan.descriptor, plan.alias)
+                .map_err(|e| e.to_string())?;
+        }
+        Some(std::sync::Arc::new(symbols))
+    } else {
+        None
+    };
+    let render_options = args.get_one::<String>("render_options").map(|json| {
+        let options: RenderOptionsDto = serde_json::from_str(json)
+            .map_err(|error| format!("invalid render options: {error}"))?;
+        if options.version != 1 {
+            return Err("unsupported render options version".to_owned());
+        }
+        Ok(radguard::writer::RenderOptions {
+            escape_unicode: options.escape_unicode,
+            use_imports: options.use_imports.unwrap_or(true),
+        })
+    }).transpose()?;
+    let source_unit = args
+        .get_one::<String>("source_unit")
+        .map(|json| {
+            serde_json::from_str::<crate::asc_client::apk_handler::DexSourceUnit>(json)
+                .map_err(|e| format!("invalid source unit: {e}"))
+        })
+        .transpose()?;
+    let results = if let Some(unit) = &source_unit {
+        apk_handler.try_get_class_outputs_in_unit_with_options(
+            unit,
+            &targets,
+            semantic_metadata,
+            names,
+            symbols,
+            render_options,
+        )?
+    } else {
+        apk_handler.try_get_class_outputs_with_symbols(
+            &targets,
+            json_output,
+            semantic_metadata,
+            names,
+            symbols,
+        )?
+    };
     let t_end = Instant::now();
 
     if debug {
@@ -282,12 +526,32 @@ fn _handle_getclass(args: &ArgMatches, mut out: impl Write) -> Result<(), String
         let items: Vec<GetClassJsonItem<'_>> = results
             .iter()
             .map(|(cls, entry)| match entry {
-                Some((dex_name, source, refs)) => GetClassJsonItem {
+                Some((dex_name, output)) => GetClassJsonItem {
                     class: cls.as_str(),
                     status: "ok",
                     dex: Some(dex_name.as_str()),
-                    source: Some(source.as_str()),
-                    member_references: refs.iter().map(MemberRefDto::from).collect(),
+                    source: Some(output.source.as_str()),
+                    member_references: output
+                        .member_references
+                        .iter()
+                        .map(MemberRefDto::from)
+                        .collect(),
+                    metadata_version: semantic_metadata.then_some(1),
+                    variable_metadata_version: semantic_metadata.then_some(1),
+                    symbol_metadata_version: semantic_metadata.then_some(1),
+                    render_options: output.render_options.map(|options| RenderOptionsDto {
+                        version: 1,
+                        escape_unicode: options.escape_unicode,
+                        use_imports: (!options.use_imports).then_some(false),
+                    }),
+                    input_revision: output.input_revision.as_deref(),
+                    source_unit: source_unit.as_ref(),
+                    tool_revision: native_build,
+                    method_variables: output
+                        .method_variables
+                        .iter()
+                        .map(MethodVariablesDto::from)
+                        .collect(),
                     error: None,
                 },
                 None => {
@@ -298,17 +562,46 @@ fn _handle_getclass(args: &ArgMatches, mut out: impl Write) -> Result<(), String
                         dex: None,
                         source: None,
                         member_references: Vec::new(),
+                        metadata_version: None,
+                        variable_metadata_version: None,
+                        symbol_metadata_version: None,
+                        render_options: None,
+                        input_revision: None,
+                        source_unit: source_unit.as_ref(),
+                        tool_revision: None,
+                        method_variables: Vec::new(),
                         error: Some(format!("Class {cls} not found in APK.")),
                     }
                 }
             })
             .collect();
-        let serialized = serde_json::to_string_pretty(&items)
-            .map_err(|error| format!("cannot serialize JSON: {error}"))?;
-        if let Some(output) = args.get_one::<String>("output") {
-            write_text(output, &serialized)?;
+        if semantic_metadata {
+            // Exact spans add many records; stream their JSON instead of holding a
+            // second, escaped copy of every source and reference in one String.
+            if let Some(output) = args.get_one::<String>("output") {
+                let file =
+                    File::create(output).map_err(|e| format!("cannot write {output}: {e}"))?;
+                let mut file = BufWriter::new(file);
+                serde_json::to_writer_pretty(&mut file, &items)
+                    .map_err(|e| format!("cannot serialize JSON: {e}"))?;
+                writeln!(file)
+                    .and_then(|()| file.flush())
+                    .map_err(|e| format!("cannot write {output}: {e}"))?;
+            }
+            let mut buffered = BufWriter::new(&mut out);
+            serde_json::to_writer_pretty(&mut buffered, &items)
+                .map_err(|e| format!("cannot serialize JSON: {e}"))?;
+            writeln!(buffered)
+                .and_then(|()| buffered.flush())
+                .map_err(|e| format!("cannot write output: {e}"))?;
+        } else {
+            let serialized = serde_json::to_string_pretty(&items)
+                .map_err(|error| format!("cannot serialize JSON: {error}"))?;
+            if let Some(output) = args.get_one::<String>("output") {
+                write_text(output, &serialized)?;
+            }
+            writeln!(out, "{serialized}").map_err(|e| format!("cannot write output: {e}"))?;
         }
-        writeln!(out, "{serialized}").map_err(|e| format!("cannot write output: {e}"))?;
         if !missing.is_empty() {
             return Err(format!(
                 "Class {} not found in APK.",
@@ -322,7 +615,8 @@ fn _handle_getclass(args: &ArgMatches, mut out: impl Write) -> Result<(), String
     let mut missing = Vec::new();
     for (idx, (cls, entry)) in results.iter().enumerate() {
         match entry {
-            Some((dex_name, source, _)) => {
+            Some((dex_name, output)) => {
+                let source = &output.source;
                 if idx > 0 && !combined.ends_with('\n') {
                     combined.push('\n');
                 }
@@ -720,7 +1014,9 @@ fn _handle_findrefs(args: &ArgMatches, mut out: impl Write) -> Result<(), String
         let dex_lines = apk_handler.try_for_each_findrefs(&find_type, &find, display)?;
         let mut output_fp = output_path
             .as_deref()
-            .map(|path| File::create(path).map_err(|error| format!("cannot create {path}: {error}")))
+            .map(|path| {
+                File::create(path).map_err(|error| format!("cannot create {path}: {error}"))
+            })
             .transpose()?;
         for (_dex_name, lines) in dex_lines {
             if lines.is_empty() {
@@ -943,6 +1239,23 @@ pub fn _build_main_parser() -> Command {
                         .long("json")
                         .action(ArgAction::SetTrue)
                         .help("Emit JSON with source and member reference metadata."),
+                )
+                .arg(
+                    Arg::new("semantic_metadata")
+                        .long("semantic-metadata")
+                        .requires("json")
+                        .action(ArgAction::SetTrue)
+                        .help("Collect experimental exact type spans and declaration scopes."),
+                )
+                .arg(Arg::new("render_options").long("render-options").requires("source_unit")
+                    .help("Versioned renderer options as JSON; requires exact input selection."))
+                .arg(Arg::new("source_unit").long("source-unit").requires("semantic_metadata")
+                    .help("Select exact DEX bytes: JSON {entries: [outer, inner], offset: headerOffset}. Empty entries selects a raw DEX."))
+                .arg(Arg::new("symbol_names").long("symbol-names").requires("semantic_metadata")
+                    .help("Render canonical DEX symbols using the host alias policy JSON plan."))
+                .arg(
+                    Arg::new("variable_names").long("variable-names").requires("semantic_metadata")
+                        .help("Render native variable identities using a version-checked JSON name plan."),
                 )
                 .arg(Arg::new("apk_path").required(true).help("Path to the input APK file."))
                 .arg(
